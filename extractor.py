@@ -63,40 +63,74 @@ if st.sidebar.button("📊 Extract JSON Metrics"):
 st.divider()
 st.subheader(f"💬 Chatting as {current_user}")
 
-# Render previous messages
+# 1. Render previous messages AND their expanders
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        
+        if message.get("thoughts"):
+            with st.expander("🧠 See Agent Reasoning"):
+                st.write(message["thoughts"])
+                
+        if message.get("code_execution"):
+            with st.expander("💻 See Code Execution"):
+                for step in message["code_execution"]:
+                    if step["type"] == "code":
+                        st.markdown(f"**Generated Code:**\n```python\n{step['code']}\n```")
+                    elif step["type"] == "result":
+                        st.markdown(f"**Execution Output:**\n```text\n{step['output']}\n```")
+                        
+        if message.get("search_queries"):
+            with st.expander("🌐 See Web Search Queries"):
+                for q in message["search_queries"]:
+                    st.write(f"🔍 {q}")
 
-# Chat Input
-if user_question := st.chat_input("How can I help you today?"):
-    
-    # Display user message instantly
+# 2. Handle New User Questions
+if user_question := st.chat_input("Ask a question about the report or live market..."):
     with st.chat_message("user"):
         st.markdown(user_question)
         
     st.session_state.messages.append({"role": "user", "content": user_question})
 
     with st.chat_message("assistant"):
-        with st.spinner("API is analyzing PDF and browsing the live web..."):
+        with st.spinner("API is analyzing PDF, writing code, and browsing the web..."):
             
-            # HTTP POST: Send the question to the backend chat agent
             payload = {"question": user_question}
             response = requests.post(f"{API_BASE_URL}/chat/{current_user}", json=payload)
             
             if response.status_code == 200:
                 data = response.json()
                 answer = data["answer"]
+                thoughts = data.get("thoughts", "")
+                code_execution = data.get("code_execution", [])
                 search_queries = data.get("search_queries", [])
                 
-                # Display the AI's response
+                # Display the primary answer
                 st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
                 
-                # Display search metadata if the backend used the web tool
+                # Render the collapsible transparency blocks
+                if thoughts:
+                    with st.expander("🧠 See Agent Reasoning"):
+                        st.write(thoughts)
+                if code_execution:
+                    with st.expander("💻 See Code Execution"):
+                        for step in code_execution:
+                            if step["type"] == "code":
+                                st.markdown(f"**Generated Code:**\n```python\n{step['code']}\n```")
+                            elif step["type"] == "result":
+                                st.markdown(f"**Execution Output:**\n```text\n{step['output']}\n```")
                 if search_queries:
                     with st.expander("🌐 See Web Search Queries"):
                         for q in search_queries:
                             st.write(f"🔍 {q}")
+
+                # Save EVERYTHING to Streamlit's temporary memory
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": answer,
+                    "thoughts": thoughts,
+                    "code_execution": code_execution,
+                    "search_queries": search_queries
+                })
             else:
                 st.error("The API encountered an error processing your request.")

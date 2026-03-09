@@ -174,7 +174,14 @@ def chat_with_agent(user_id: str, request: ChatRequest):
     """
     
     agent_config = types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())]
+        tools=[
+            types.Tool(google_search=types.GoogleSearch()),
+            types.Tool(code_execution=types.ToolCodeExecution()) # <-- The Math Agent
+        ],
+        thinking_config=types.ThinkingConfig(
+            include_thoughts=True # <-- The Reasoning Agent
+        ),
+        temperature=0.0 # Keeps the model highly factual
     )
     
     # 5. Generate Answer
@@ -184,10 +191,36 @@ def chat_with_agent(user_id: str, request: ChatRequest):
         config=agent_config
     )
     
-    # 6. Save Assistant Answer to TinyDB
-    chat_collection.insert({"user_id": user_id, "role": "assistant", "content": final_answer.text})
+    # 6. Parse the Agent's multi-part response
+    answer_text = ""
+    thoughts_text = ""
+    code_data = []
     
-    # 7. Extract Search Metadata
+    try:
+        for part in final_answer.candidates[0].content.parts:
+            # Extract Reasoning (Thoughts)
+            if getattr(part, 'thought', False) and part.text:
+                thoughts_text += part.text + "\n\n"
+            # Extract the actual text answer
+            elif part.text:
+                answer_text += part.text
+                
+            # Extract Python Code written by the AI
+            if getattr(part, 'executable_code', None):
+                code_data.append({
+                    "type": "code",
+                    "code": part.executable_code.code
+                })
+            # Extract the Terminal Output of that code
+            if getattr(part, 'code_execution_result', None):
+                code_data.append({
+                    "type": "result",
+                    "output": part.code_execution_result.output
+                })
+    except Exception:
+        answer_text = final_answer.text # Safety fallback
+        
+    # 7. Extract Web Search Metadata
     search_queries = []
     try:
         queries = final_answer.candidates[0].grounding_metadata.web_search_queries
@@ -195,12 +228,26 @@ def chat_with_agent(user_id: str, request: ChatRequest):
             search_queries = list(queries)
     except Exception:
         pass
-        
-    # Return the payload to the frontend
-    return {
-        "answer": final_answer.text,
+
+    # 8. Save EVERYTHING to TinyDB
+    final_clean_answer = answer_text.strip() or final_answer.text
+    chat_collection.insert({
+        "user_id": user_id, 
+        "role": "assistant", 
+        "content": final_clean_answer,
+        "thoughts": thoughts_text.strip(),
+        "code_execution": code_data,
         "search_queries": search_queries
+    })
+        
+    return {
+        "answer": final_clean_answer,
+        "search_queries": search_queries,
+        "thoughts": thoughts_text.strip(),
+        "code_execution": code_data
     }
+    
+
 
 # ---------------------------------------------------------
 # ENDPOINT 4: Get Chat History
@@ -209,5 +256,10 @@ def chat_with_agent(user_id: str, request: ChatRequest):
 def get_chat_history(user_id: str):
     MessageQuery = Query()
     user_docs = chat_collection.search(MessageQuery.user_id == user_id)
-    # Return just the role and content for the frontend
-    return [{"role": doc["role"], "content": doc["content"]} for doc in user_docs]
+    return [{
+        "role": doc["role"], 
+        "content": doc["content"],
+        "thoughts": doc.get("thoughts", ""),
+        "code_execution": doc.get("code_execution", []),
+        "search_queries": doc.get("search_queries", [])
+    } for doc in user_docs]
