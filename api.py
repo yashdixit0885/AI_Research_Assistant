@@ -7,7 +7,9 @@ import PyPDF2
 import os
 import io
 from dotenv import load_dotenv
-from tinydb import TinyDB, Query # <-- NEW: Import TinyDB
+from tinydb import TinyDB, Query
+from typing import List
+
 
 # Unlock the vault
 load_dotenv()
@@ -22,6 +24,7 @@ app = FastAPI(title="AI Financial Researcher API", version="1.0")
 # DATA SCHEMAS
 # ---------------------------------------------------------
 class FinancialMetrics(BaseModel):
+    source_file: str = Field(description="The exact name of the PDF file this data came from")
     company_name: str = Field(description="The name of the company")
     fiscal_period: str = Field(description="The quarter or year of the report (e.g., Q4 2023)")
     total_revenue: str = Field(description="Total revenue reported, including the currency/scale")
@@ -56,10 +59,7 @@ async def upload_document(user_id: str, file: UploadFile = File(...)):
 
     # Database operations
     collection = chroma_client.get_or_create_collection(name="earnings_reports")
-    try:
-        collection.delete(where={"user_id": user_id})
-    except Exception:
-        pass 
+
         
     embeddings_list = []
     ids_list = []
@@ -79,44 +79,116 @@ async def upload_document(user_id: str, file: UploadFile = File(...)):
     return {"message": f"Successfully indexed {len(text_chunks)} chunks for {user_id}", "filename": file.filename}
 
 # ---------------------------------------------------------
-# ENDPOINT 2: Extract Structured JSON
+# ENDPOINT: Get User Documents
 # ---------------------------------------------------------
-@app.get("/api/extract/{user_id}", response_model=FinancialMetrics)
+@app.get("/api/documents/{user_id}")
+def get_user_documents(user_id: str):
+    collection = chroma_client.get_or_create_collection(name="earnings_reports")
+    
+    # Fetch all metadata tags for this user
+    results = collection.get(where={"user_id": user_id}, include=["metadatas"])
+    
+    if not results or not results["metadatas"]:
+        return {"documents": []}
+        
+    # Use a Python Set to extract only the unique filenames
+    unique_docs = set(
+        meta.get("source_file") 
+        for meta in results["metadatas"] 
+        if meta and "source_file" in meta
+    )
+    
+    return {"documents": list(unique_docs)}
+
+# ---------------------------------------------------------
+# ENDPOINT: Clear User Vault
+# ---------------------------------------------------------
+@app.delete("/api/documents/{user_id}")
+def clear_user_documents(user_id: str):
+    collection = chroma_client.get_or_create_collection(name="earnings_reports")
+    try:
+        # This acts as our "Reset" button for the user's vector space
+        collection.delete(where={"user_id": user_id})
+        return {"message": "Vault successfully cleared."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear vault: {str(e)}")
+
+# ---------------------------------------------------------
+# ENDPOINT: Delete Specific Document
+# ---------------------------------------------------------
+@app.delete("/api/documents/{user_id}/{filename}")
+def delete_specific_document(user_id: str, filename: str):
+    collection = chroma_client.get_or_create_collection(name="earnings_reports")
+    try:
+        # Delete only chunks matching BOTH the user_id AND the specific filename
+        collection.delete(
+            where={
+                "$and": [
+                    {"user_id": user_id},
+                    {"source_file": filename}
+                ]
+            }
+        )
+        return {"message": f"Successfully deleted {filename}."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
+
+# ---------------------------------------------------------
+# ENDPOINT 2: Extract Structured JSON (Multi-Document)
+# ---------------------------------------------------------
+@app.get("/api/extract/{user_id}", response_model=List[FinancialMetrics])
 def extract_metrics(user_id: str):
     collection = chroma_client.get_or_create_collection(name="earnings_reports")
     
-    query_embed = client.models.embed_content(
-        model='gemini-embedding-001',
-        contents="financial summary total revenue net income EPS forward guidance"
-    ).embeddings[0].values
-    
-    results = collection.query(
-        query_embeddings=[query_embed],
-        n_results=5,
-        where={"user_id": user_id}
-    )
-    
-    if not results['documents'] or not results['documents'][0]:
-        raise HTTPException(status_code=404, detail="No documents found for this user in the vault.")
+    # 1. Ask the database what files this user currently has
+    results = collection.get(where={"user_id": user_id}, include=["metadatas"])
+    if not results or not results["metadatas"]:
+        raise HTTPException(status_code=404, detail="No documents found in the vault.")
         
-    context = "\n\n".join(results['documents'][0])
+    unique_files = set(meta.get("source_file") for meta in results["metadatas"] if meta and "source_file" in meta)
     
-    json_config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=FinancialMetrics,
-        temperature=0.0
-    )
+    all_metrics = []
     
-    prompt = f"Extract the core financial metrics from this context:\n\n{context}"
-    
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=json_config
-    )
-    
-    import json
-    return json.loads(response.text)
+    # 2. Loop through EACH file and extract its specific metrics
+    for filename in unique_files:
+        query_embed = client.models.embed_content(
+            model='gemini-embedding-001',
+            contents="financial summary total revenue net income EPS forward guidance"
+        ).embeddings[0].values
+        
+        # TARGETED RAG: Only search chunks belonging to this specific file
+        file_results = collection.query(
+            query_embeddings=[query_embed],
+            n_results=5,
+            where={"$and": [{"user_id": user_id}, {"source_file": filename}]}
+        )
+        
+        if file_results['documents'] and file_results['documents'][0]:
+            context = "\n\n".join(file_results['documents'][0])
+            
+            json_config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=FinancialMetrics,
+                temperature=0.0
+            )
+            
+            # Tell the AI exactly which file it is looking at so it fills out the schema correctly
+            prompt = f"Extract the core financial metrics for the company in this context. The source_file is '{filename}':\n\n{context}"
+            
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=json_config
+            )
+            
+            import json
+            try:
+                # Add the extracted JSON object to our master list
+                all_metrics.append(json.loads(response.text))
+            except Exception:
+                pass
+                
+    return all_metrics
 
 # ---------------------------------------------------------
 # ENDPOINT 3: Chat with Agent (RAG + Web Search)

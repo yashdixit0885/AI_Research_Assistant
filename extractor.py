@@ -1,5 +1,7 @@
 import streamlit as st
 import requests
+import pandas as pd
+import io
 
 # Point to your local FastAPI server
 API_BASE_URL = "http://127.0.0.1:8000/api"
@@ -27,35 +29,93 @@ if "active_user" not in st.session_state or st.session_state.active_user != curr
         st.error("🚨 Cannot connect to the API backend. Is FastAPI running?")
 
 # ---------------------------------------------------------
-# PDF UPLOAD & JSON EXTRACTION
+# PDF UPLOAD & VAULT MANAGEMENT
 # ---------------------------------------------------------
 st.sidebar.subheader("📂 Document Management")
 
+# 1. Fetch active documents from the backend API
+try:
+    docs_response = requests.get(f"{API_BASE_URL}/documents/{current_user}")
+    active_docs = docs_response.json().get("documents", []) if docs_response.status_code == 200 else []
+except requests.exceptions.ConnectionError:
+    active_docs = []
+    st.sidebar.error("🚨 API disconnected. Is FastAPI running?")
+
+# 2. Display the vault contents and delete controls
+if active_docs:
+    st.sidebar.write("**Active Vault Documents:**")
+    for doc in active_docs:
+        col1, col2 = st.sidebar.columns([4, 1]) # 4 parts text, 1 part button
+        with col1:
+            st.write(f"📄 {doc}")
+        with col2:
+            # Individual delete button
+            if st.button("❌", key=f"del_{doc}", help=f"Remove {doc}"):
+                requests.delete(f"{API_BASE_URL}/documents/{current_user}/{doc}")
+                st.rerun() # Instantly refresh the UI
+    
+    st.sidebar.write("---")
+    # Master clear button
+    if st.sidebar.button("🗑️ Clear Entire Vault", type="primary", use_container_width=True):
+        requests.delete(f"{API_BASE_URL}/documents/{current_user}")
+        st.rerun()
+else:
+    st.sidebar.info("⚠️ Your vault is empty. Please upload a PDF.")
+
+# 3. The Uploader
 uploaded_file = st.sidebar.file_uploader("Upload a new PDF to your vault", type="pdf", key=f"pdf_uploader_{current_user}")
 
 if uploaded_file is not None:
-    if st.sidebar.button("Build AI Index"):
+    if st.sidebar.button("➕ Add to Vault", use_container_width=True):
         with st.spinner("Sending document to backend API..."):
-            # HTTP POST: Send the file to the backend
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
             response = requests.post(f"{API_BASE_URL}/upload/{current_user}", files=files)
             
             if response.status_code == 200:
                 st.sidebar.success(f"✅ {response.json()['message']}")
+                st.rerun() # Instantly refresh the UI to show the new file
             else:
                 st.sidebar.error("Failed to process document.")
 
 st.sidebar.divider()
 
-if st.sidebar.button("📊 Extract JSON Metrics"):
-    with st.sidebar.status("Fetching structured data from API..."):
-        # HTTP GET: Request the structured JSON extraction
+# ---------------------------------------------------------
+# EXCEL METRICS EXTRACTION
+# ---------------------------------------------------------
+st.sidebar.subheader("📊 Financial Reports")
+
+# 1. The Generation Button
+if st.sidebar.button("⚙️ Generate Summary Excel", use_container_width=True):
+    with st.sidebar.status("Analyzing documents and extracting metrics..."):
+        # HTTP GET: Request the structured JSON from our API
         response = requests.get(f"{API_BASE_URL}/extract/{current_user}")
         
         if response.status_code == 200:
-            st.sidebar.json(response.json())
+            data = response.json()
+            
+            # Convert the JSON dictionary into a Pandas DataFrame (a table)
+            df = pd.DataFrame(data)
+            
+            # Create an in-memory Excel file
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='Summary Metrics')
+            
+            # Save the raw Excel bytes to Streamlit's session state
+            st.session_state[f"excel_file_{current_user}"] = buffer.getvalue()
+            st.sidebar.success("✅ Excel file generated!")
         else:
-            st.sidebar.error(response.json().get("detail", "Failed to extract metrics."))
+            st.sidebar.error("Failed to extract metrics.")
+
+# 2. The Download Button (Only shows up AFTER generation is complete)
+if f"excel_file_{current_user}" in st.session_state:
+    st.sidebar.download_button(
+        label="📥 Download Excel File",
+        data=st.session_state[f"excel_file_{current_user}"],
+        file_name=f"Financial_Summary_{current_user}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
 
 # ---------------------------------------------------------
 # CHAT INTERFACE
